@@ -1,0 +1,9 @@
+kafka-docker/
+venv/
+.DS_Store
+.env
+.idea/
+__pycache__/
+config*.json
+kubeconfigs
+*-data/
