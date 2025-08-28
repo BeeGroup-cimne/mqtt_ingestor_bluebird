@@ -34,7 +34,7 @@ def create_uri(x):
             stype = "sala"
             sid = slugify(x.Sala)
         elif "sensor" in x and pd.notna(x["sensor"]):
-            id_building = 1
+            id_building = 2
             stype = "sensor"
             sid = slugify(x.sensor)
         else:
@@ -51,7 +51,7 @@ def start_collecting(config=None):
     # The callback for when the client receives a CONNACK response from the server.
 
     def on_connect(client, userdata, flags, reason_code, properties):
-        print(f"Connected with result code {reason_code}")
+        logger.info(f"Connected with result code {reason_code}")
         # Subscribing in on_connect() means that if we lose the connection and
         # reconnect then subscriptions will be renewed.
         client.subscribe(config['mqtt']['topic'])
@@ -60,7 +60,7 @@ def start_collecting(config=None):
     def on_message(client, userdata, msg):
         producer = beelib.beekafka.create_kafka_producer(config['kafka']['connection'], encoding="JSON")
         # Generar la uri i guardar les dades a HBASE
-        print(str(msg.payload))
+        logger.debug(f"Received message: {msg.topic}")
         data = json.loads(msg.payload.decode())
         df = pd.DataFrame(data)
         if df.empty:
@@ -94,6 +94,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description='Gathers MQTT data')
     ap.add_argument('--config', '-c', help='Configuration file', required=False, default=None)
 
+    logger.debug("starting ingestor")
     dotenv.load_dotenv()
     if os.getenv("PYCHARM_HOSTED") is not None:
         args = ap.parse_args([])
@@ -104,4 +105,5 @@ if __name__ == "__main__":
                 start_collecting(**args.__dict__)
                 break
             except Exception as e:
+                logger.debug(f"connecition error: {e}")
                 time.sleep(4)
