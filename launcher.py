@@ -26,14 +26,22 @@ NAMESPACE = "https://bluebird-project.eu/data#"
 def create_uri(x):
     try:
         if "Circutor" in x and pd.notna(x["Circutor"]):
-            return f"{NAMESPACE}-circutor-{slugify(x.Circutor)}-{slugify(x._field)}"
+            id_building = 1
+            stype = "circutor"
+            sid = slugify(x.Circutor)
         elif "Sala" in x and pd.notna(x["Sala"]):
-            return f"{NAMESPACE}-sala-{slugify(x.Sala)}-{slugify(x._field)}"
+            id_building = 1
+            stype = "sala"
+            sid = slugify(x.Sala)
         elif "sensor" in x and pd.notna(x["sensor"]):
-            return f"{NAMESPACE}-sensor-{slugify(x.sensor)}-{slugify(x._field)}"
+            id_building = 1
+            stype = "sensor"
+            sid = slugify(x.sensor)
         else:
             print(f"Unknown type: {x}")
             return None
+        s_field = slugify(x._field)
+        return f"{NAMESPACE}measurement-influx-{id_building}-{stype}-{sid}-{s_field}-PT1H"
     except:
         return "error"
 
