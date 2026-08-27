@@ -1,0 +1,107 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # --- Infraestructura (igual per tots els environments) ---
+  ECR_REGISTRY: 853583158095.dkr.ecr.eu-west-1.amazonaws.com
+  ECR_REPOSITORY: ecr-bluebird-mqtt-ingestor
+  AWS_REGION: eu-west-1
+  # --- Específic d'aquest environment (canviar al copiar per staging/dev) ---
+  ENV_TAG: prod
+  KUBE_DIR: kubeconfig/prod
+  KUBE_NAMESPACE: bluebird
+  EKS_CLUSTER_NAME: eks-pro-beegroup
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+      - name: Get commit SHAs
+        id: vars
+        run: |
+          PROJECT_SHA=$(git rev-parse --short HEAD)
+          echo "IMAGE_TAG=${PROJECT_SHA}" >> $GITHUB_OUTPUT
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ingestor
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.vars.outputs.IMAGE_TAG }}
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.ENV_TAG }}
+          cache-from: type=registry,ref=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:cache-prod
+          cache-to: type=registry,ref=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:cache-prod,mode=max
+
+      - name: Configure kubeconfig (EKS)
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER_NAME }} \
+            --region ${{ env.AWS_REGION }}
+        # Prerequisits IAM:
+        #   - Permís eks:DescribeCluster al policy de l'IAM user/role
+        #   - L'IAM ARN afegit al EKS access management (aws-auth ConfigMap o Access Entries)
+        #   - RBAC: permís per apply CronJobs/Deployments al namespace $KUBE_NAMESPACE
+
+      - name: Apply Kubernetes manifests
+        env:
+          IMAGE_TAG: ${{ steps.vars.outputs.IMAGE_TAG }}
+        run: |
+          FAILED=0
+          for yaml in $KUBE_DIR/*.yaml $KUBE_DIR/*.yml; do
+            [ -f "$yaml" ] || continue
+            echo "→ Processing $yaml"
+
+            tmpdir=$(mktemp -d)
+            awk -v dir="$tmpdir" '
+              BEGIN { n=0; file=dir "/doc_" sprintf("%03d",n) ".yaml" }
+              /^---/ { close(file); n++; file=dir "/doc_" sprintf("%03d",n) ".yaml"; next }
+              { print > file }
+            ' "$yaml"
+
+            for doc in "$tmpdir"/doc_*.yaml; do
+              [ -s "$doc" ] || continue
+              kind=$(grep '^kind:' "$doc" | awk '{print $2}')
+              name=$(grep '^  name:' "$doc" | head -1 | awk '{print $2}')
+              ns=$(grep '^  namespace:' "$doc" | head -1 | awk '{print $2}')
+              echo "  → Applying $kind/$name (tag: $IMAGE_TAG)"
+              if ! sed "s|$ECR_REGISTRY/$ECR_REPOSITORY:$ENV_TAG|$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG|g" "$doc" \
+                | kubectl apply -f -; then
+                echo "  ✗ Error applying $kind/$name"
+                FAILED=1
+                continue
+              fi
+              if [ "$kind" = "Deployment" ] || [ "$kind" = "StatefulSet" ]; then
+                resource=$(echo "$kind" | tr '[:upper:]' '[:lower:]')
+                echo "  → Waiting rollout: $resource/$name -n $ns"
+                if ! kubectl rollout status "$resource/$name" -n "$ns" --timeout=5m; then
+                  echo "  ✗ Rollout failed: $resource/$name"
+                  FAILED=1
+                fi
+              fi
+            done
+            rm -rf "$tmpdir"
+          done
+          exit $FAILED
+
+      - name: Verify deployment and statefulsets
+        run: |
+          echo "Deployed image: $ECR_REGISTRY/$ECR_REPOSITORY:${{ steps.vars.outputs.IMAGE_TAG }}"
+          kubectl get cronjobs,deployments,statefulsets -n $KUBE_NAMESPACE
