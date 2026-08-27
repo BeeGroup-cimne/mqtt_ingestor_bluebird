@@ -59,20 +59,21 @@ def start_collecting(config=None):
     # The callback for when a PUBLISH message is received from the server.
     def on_message(client, userdata, msg):
         producer = beelib.beekafka.create_kafka_producer(config['kafka']['connection'], encoding="JSON")
-        # Generar la uri i guardar les dades a HBASE
+        # Generar la uri i guardar les dades a Cassandra
         logger.debug(f"Received message: {msg.topic}")
         data = json.loads(msg.payload.decode())
         df = pd.DataFrame(data)
         if df.empty:
             return
-        df['uri'] = df.apply(create_uri, axis=1)
-        df = df.dropna(subset=['uri'])
-        df = df.drop_duplicates(subset=['uri'])
-        df['_time'] = pd.to_datetime(df["_time"]).astype(int) // 10**9
-        df = df[["uri", "_time", "_value"]]
+        df['id'] = df.apply(create_uri, axis=1)
+        df = df.dropna(subset=['id'])
+        df = df.drop_duplicates(subset=['id'])
+        df['ts'] = pd.to_datetime(df["_time"]).astype(int) // 10**9
+        df = df.rename(columns={"_value": "value"})[["id", "ts", "value"]]
         beelib.beekafka.send_to_kafka(producer, config['kafka']['topic'], None,
                                       df.to_dict(orient='records'),
-                                      tables=["bluebird:static_montcada_"], row_keys=[["uri", "_time"]])
+                                      tables=[config["cassandra"]["montcada"]["table"]],
+                                      row_keys=config["cassandra"]["montcada"]["row_keys"])
         producer.close()
 
     mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
