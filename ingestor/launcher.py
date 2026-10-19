@@ -76,14 +76,14 @@ def start_collecting(config=None):
                                       row_keys=config["cassandra"]["montcada"]["row_keys"])
         producer.close()
 
-    mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2 , transport="websockets")
+    mqtt_client.ws_set_options(path="/mqtt")
     mqtt_client.on_connect = on_connect
     mqtt_client.on_message = on_message
 
     mqtt_client.username_pw_set(config['mqtt']['connection']['username'], config['mqtt']['connection']['password'])
-    context = ssl.create_default_context()
-    mqtt_client.tls_set_context(context)
-    mqtt_client.connect(**config['mqtt']['connection']["server"])
+    mqtt_client.tls_set_context(ssl.create_default_context())
+    mqtt_client.connect(**config['mqtt']['connection']["server"], keepalive = 30)
     # Blocking call that processes network traffic, dispatches callbacks and
     # handles reconnecting.
     # Other loop*() functions are available that give a threaded interface and a
