@@ -58,23 +58,33 @@ def start_collecting(config=None):
 
     # The callback for when a PUBLISH message is received from the server.
     def on_message(client, userdata, msg):
-        producer = beelib.beekafka.create_kafka_producer(config['kafka']['connection'], encoding="JSON")
-        # Generar la uri i guardar les dades a Cassandra
-        logger.debug(f"Received message: {msg.topic}")
-        data = json.loads(msg.payload.decode())
-        df = pd.DataFrame(data)
-        if df.empty:
-            return
-        df['id'] = df.apply(create_uri, axis=1)
-        df = df.dropna(subset=['id'])
-        df = df.drop_duplicates(subset=['id'])
-        df['ts'] = pd.to_datetime(df["_time"]).astype(int) // 10**9
-        df = df.rename(columns={"_value": "value"})[["id", "ts", "value"]]
-        beelib.beekafka.send_to_kafka(producer, config['kafka']['topic'], None,
-                                      df.to_dict(orient='records'),
-                                      tables=[config["cassandra"]["montcada"]["table"]],
-                                      row_keys=config["cassandra"]["montcada"]["row_keys"])
-        producer.close()
+        producer = None
+        try:
+            logger.info(f"Received message: topic={msg.topic} bytes={len(msg.payload)}")
+            data = json.loads(msg.payload.decode())
+            df = pd.DataFrame(data)
+            if df.empty:
+                logger.warning(f"Empty payload on {msg.topic}")
+                return
+            n_in = len(df)
+            df['id'] = df.apply(create_uri, axis=1)
+            df = df.dropna(subset=['id'])
+            n_bad = int((df['id'] == "error").sum())
+            df = df.drop_duplicates(subset=['id'])
+            df['ts'] = pd.to_datetime(df["_time"]).astype(int) // 10**9
+            df = df.rename(columns={"_value": "value"})[["id", "ts", "value"]]
+            producer = beelib.beekafka.create_kafka_producer(config['kafka']['connection'], encoding="JSON")
+            beelib.beekafka.send_to_kafka(producer, config['kafka']['topic'], None,
+                                          df.to_dict(orient='records'),
+                                          tables=[config["cassandra"]["montcada"]["table"]],
+                                          row_keys=config["cassandra"]["montcada"]["row_keys"])
+            logger.info(f"Sent to Kafka: rows_in={n_in} rows_out={len(df)} bad_uri={n_bad} "
+                        f"ts_min={df['ts'].min()} ts_max={df['ts'].max()}")
+        except Exception:
+            logger.exception(f"Error processing message on {msg.topic}")
+        finally:
+            if producer is not None:
+                producer.close()
 
     mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2 , transport="websockets")
     mqtt_client.ws_set_options(path="/mqtt")
