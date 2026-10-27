@@ -94,11 +94,12 @@ def start_collecting(config=None):
     mqtt_client.username_pw_set(config['mqtt']['connection']['username'], config['mqtt']['connection']['password'])
     mqtt_client.tls_set_context(ssl.create_default_context())
     mqtt_client.connect(**config['mqtt']['connection']["server"], keepalive = 30)
-    # Blocking call that processes network traffic, dispatches callbacks and
-    # handles reconnecting.
-    # Other loop*() functions are available that give a threaded interface and a
-    # manual interface.
-    mqtt_client.loop_forever()
+    # Process network traffic, dispatch callbacks and handle reconnecting on
+    # every iteration. The work loop is the heartbeat source: beat() must run
+    # here (not in a side thread) so a hung loop stops the heartbeat.
+    while True:
+        beelib.beeheartbeat.beat()
+        mqtt_client.loop(timeout=10)
 
 
 if __name__ == "__main__":
