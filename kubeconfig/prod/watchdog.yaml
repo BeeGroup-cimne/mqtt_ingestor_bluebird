@@ -1,0 +1,167 @@
+# Watchdog del pipeline Montcada: avisa a Discord si dejan de llegar datos nuevos
+# a Cassandra (bluebird.static_montcada_) durante mas tiempo del umbral por fuente.
+# static_montcada_ es SOLO LECTURA aqui; el unico estado que escribe es bluebird.watchdog_alert
+# (creada una vez a mano: CREATE TABLE bluebird.watchdog_alert (source text PRIMARY KEY, last_alert int);)
+# El webhook de Discord NO va en git: kubectl -n bluebird create secret generic montcada-watchdog-secret \
+#   --from-literal=webhook_url='https://discord.com/api/webhooks/...'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: montcada-watchdog-script
+  namespace: bluebird
+data:
+  monitor.py: |
+    #!/usr/bin/env python3
+    # Watchdog: si los datos de Montcada dejan de llegar a Cassandra, avisa a Discord.
+    import json, os, sys, time, traceback, urllib.request
+    from cassandra.cluster import Cluster
+    from cassandra.auth import PlainTextAuthProvider
+
+    BASE = "https://bluebird-project.eu/data#measurement-"
+    SOURCES = {  # nombre -> (sufijo URI, umbral minutos de datos nuevos)
+        # montcada: burst horario :00 reemite hasta "ahora" -> retardo legitimo max ~61 min
+        # sensores: burst :45 reemite bloque [H-2,H-1] -> retardo legitimo max ~165 min
+        "montcada HVAC sala-19": ("influx-1-sala-19-tempsp-PT1H", 100),
+        "montcada Circutor-1": ("influx-1-circutor-1-e-act-PT1H", 100),
+        "sensor FV potencia": ("influx-2-sensor-fv-potencia-activa-value-PT1H", 180),
+        "sensor consumo edificio": ("influx-2-sensor-edi-consum-eactiva-edifici-value-PT1H", 180),
+    }
+    REALERT_S = float(os.environ.get("REALERT_HOURS", "4")) * 3600
+    RECOVER_WINDOW_S = 24 * 3600
+    TABLE = "bluebird.static_montcada_"
+
+    def post_discord(text):
+        req = urllib.request.Request(
+            os.environ["DISCORD_WEBHOOK_URL"],
+            data=json.dumps({"content": text, "allowed_mentions": {"parse": []}}).encode(),
+            headers={"Content-Type": "application/json",
+                     "User-Agent": "montcada-watchdog/1.0 (bluebird pipeline monitor)"})
+        for i in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    if r.status < 300:
+                        return
+                    raise RuntimeError(f"discord http {r.status}")
+            except Exception:
+                if i == 2:
+                    raise
+                time.sleep(2 ** (i + 1))
+
+    def last_ts(s, uri):
+        for year in (int(time.strftime("%Y")), int(time.strftime("%Y")) - 1):
+            row = s.execute(
+                f"SELECT ts FROM {TABLE} WHERE hash=%s AND year=%s ORDER BY ts DESC LIMIT 1",
+                (uri, year)).one()
+            if row:
+                return row.ts
+        return None
+
+    def count_since(s, uri, since):
+        # ponytail: a medianoche del 31/12 la ventana cruza de anio; se suman ambos anios
+        total = 0
+        for year in {int(time.strftime("%Y", time.gmtime(since))), int(time.strftime("%Y"))}:
+            total += s.execute(
+                f"SELECT count(*) FROM {TABLE} WHERE hash=%s AND year=%s AND ts>=%s",
+                (uri, year, since)).one()[0]
+        return total
+
+    def main():
+        cfg = json.load(open(os.environ.get("CONF_FILE", "/config.json")))["cassandra"]
+        auth = PlainTextAuthProvider(cfg["auth"]["username"], cfg["auth"]["password"])
+        cluster = Cluster(contact_points=cfg["connection"]["contact_points"],
+                          port=cfg["connection"]["port"], auth_provider=auth,
+                          connect_timeout=10)
+        s = cluster.connect()
+        s.default_timeout = 20
+        now = int(time.time())
+        stale = 0
+        for name, (suffix, minutes) in SOURCES.items():
+            thr = int(os.environ.get("FORCE_STALE_MINUTES", minutes))
+            uri = BASE + suffix
+            since = now - thr * 60
+            n = count_since(s, uri, since)
+            row = s.execute("SELECT last_alert FROM bluebird.watchdog_alert WHERE source=%s",
+                            (name,)).one()
+            if n == 0:
+                stale += 1
+                lt = last_ts(s, uri)
+                age = f"{(now - lt) / 3600:.1f} h" if lt else "desconocida"
+                if row is None or now - row.last_alert > REALERT_S:
+                    post_discord(f"🔴 **montcada-watchdog**: sin datos nuevos de **{name}** "
+                                 f"(ultimo dato hace {age}; umbral {thr} min)")
+                    s.execute("INSERT INTO bluebird.watchdog_alert (source, last_alert) "
+                              "VALUES (%s, %s)", (name, now))
+                print(f"STALE {name}: 0 filas desde {since}")
+            else:
+                if row and now - row.last_alert < RECOVER_WINDOW_S:
+                    post_discord(f"✅ **montcada-watchdog**: **{name}** recuperado")
+                if row:
+                    s.execute("DELETE FROM bluebird.watchdog_alert WHERE source=%s", (name,))
+                print(f"OK {name}: {n} filas en ventana")
+        cluster.shutdown()
+        print(f"watchdog: {len(SOURCES) - stale} ok / {stale} stale")
+
+    if __name__ == "__main__":
+        try:
+            main()
+        except Exception as e:
+            traceback.print_exc()
+            try:
+                post_discord(f"⚠️ **montcada-watchdog** ERROR: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+            sys.exit(1)
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: montcada-watchdog
+  namespace: bluebird
+spec:
+  schedule: "*/15 * * * *"
+  timeZone: Europe/Madrid
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 0
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 60
+      activeDeadlineSeconds: 120
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: watchdog
+              image: 853583158095.dkr.ecr.eu-west-1.amazonaws.com/ecr-bluebird-mqtt-ingestor:prod
+              imagePullPolicy: IfNotPresent
+              command: ["python", "-u", "/watchdog/monitor.py"]
+              env:
+                - name: DISCORD_WEBHOOK_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: montcada-watchdog-secret
+                      key: webhook_url
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  cpu: 200m
+                  memory: 192Mi
+              volumeMounts:
+                - name: script
+                  mountPath: /watchdog
+                  readOnly: true
+                - name: config
+                  mountPath: /config.json
+                  subPath: config.json
+                  readOnly: true
+          volumes:
+            - name: script
+              configMap:
+                name: montcada-watchdog-script
+            - name: config
+              secret:
+                secretName: mqtt-ingestor-secret-cassandra
