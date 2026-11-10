@@ -30,10 +30,13 @@ data:
     RECOVER_WINDOW_S = 24 * 3600
     TABLE = "bluebird.static_montcada_"
 
-    def post_discord(text):
+    def hum(delta_s):
+        return f"{delta_s // 60} min" if delta_s < 5400 else f"{delta_s / 3600:.1f} h"
+
+    def post_discord(embed):
         req = urllib.request.Request(
             os.environ["DISCORD_WEBHOOK_URL"],
-            data=json.dumps({"content": text, "allowed_mentions": {"parse": []}}).encode(),
+            data=json.dumps({"embeds": [embed]}).encode(),
             headers={"Content-Type": "application/json",
                      "User-Agent": "montcada-watchdog/1.0 (bluebird pipeline monitor)"})
         for i in range(3):
@@ -85,16 +88,29 @@ data:
             if n == 0:
                 stale += 1
                 lt = last_ts(s, uri)
-                age = f"{(now - lt) / 3600:.1f} h" if lt else "desconocida"
                 if row is None or now - row.last_alert > REALERT_S:
-                    post_discord(f"🔴 **montcada-watchdog**: sin datos nuevos de **{name}** "
-                                 f"(ultimo dato hace {age}; umbral {thr} min)")
+                    post_discord({
+                        "title": f"🔴 Montcada: **{name}** sense dades noves",
+                        "description": "Pipeline Montcada aturat o sense dades.",
+                        "color": 0xE74C3C,
+                        "fields": [
+                            {"name": "🕐 Últim valor",
+                             "value": f"fa **{hum(now - lt)}**" if lt else "sense dades conegudes",
+                             "inline": True},
+                            {"name": "⏱ Umbral", "value": f"{thr} min", "inline": True},
+                        ],
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "footer": {"text": "montcada-watchdog · bluebird"}})
                     s.execute("INSERT INTO bluebird.watchdog_alert (source, last_alert) "
                               "VALUES (%s, %s)", (name, now))
                 print(f"STALE {name}: 0 filas desde {since}")
             else:
                 if row and now - row.last_alert < RECOVER_WINDOW_S:
-                    post_discord(f"✅ **montcada-watchdog**: **{name}** recuperado")
+                    post_discord({"title": f"✅ Montcada: **{name}** recuperat",
+                                  "description": "Les dades tornen a arribar a Cassandra.",
+                                  "color": 0x2ECC71,
+                                  "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                  "footer": {"text": "montcada-watchdog · bluebird"}})
                 if row:
                     s.execute("DELETE FROM bluebird.watchdog_alert WHERE source=%s", (name,))
                 print(f"OK {name}: {n} filas en ventana")
@@ -107,7 +123,11 @@ data:
         except Exception as e:
             traceback.print_exc()
             try:
-                post_discord(f"⚠️ **montcada-watchdog** ERROR: {type(e).__name__}: {e}")
+                post_discord({"title": "⚠️ montcada-watchdog ERROR",
+                              "description": f"{type(e).__name__}: {e}",
+                              "color": 0xF1C40F,
+                              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                              "footer": {"text": "montcada-watchdog · bluebird"}})
             except Exception:
                 pass
             sys.exit(1)
