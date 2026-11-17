@@ -50,6 +50,18 @@ data:
                     raise
                 time.sleep(2 ** (i + 1))
 
+    _session = None  # s'exporta des de main per poder logar errors
+
+    def log_event(s, source, kind):
+        # auditoria d'avisos a Cassandra; best-effort: mai pot tombar l'alerta a Discord
+        if s is None:
+            return
+        try:
+            s.execute("INSERT INTO bluebird.watchdog_log (source, ts, kind) VALUES (%s, %s, %s)",
+                      (source, int(time.time()), kind))
+        except Exception:
+            pass
+
     def last_ts(s, uri):
         for year in (int(time.strftime("%Y")), int(time.strftime("%Y")) - 1):
             row = s.execute(
@@ -71,10 +83,22 @@ data:
     def main():
         cfg = json.load(open(os.environ.get("CONF_FILE", "/config.json")))["cassandra"]
         auth = PlainTextAuthProvider(cfg["auth"]["username"], cfg["auth"]["password"])
-        cluster = Cluster(contact_points=cfg["connection"]["contact_points"],
-                          port=cfg["connection"]["port"], auth_provider=auth,
-                          connect_timeout=10)
-        s = cluster.connect()
+        cps = os.environ.get("CASSANDRA_CONTACT_POINTS") or cfg["connection"]["contact_points"]
+        if isinstance(cps, str):
+            cps = [x.strip() for x in cps.split(",") if x.strip()]
+        cluster = s = None
+        for i in range(3):  # retry: un micro-tall de DNS del servei no ha de generar un ⚠️
+            try:
+                cluster = Cluster(contact_points=cps, port=cfg["connection"]["port"],
+                                  auth_provider=auth, connect_timeout=10)
+                s = cluster.connect()
+                break
+            except Exception:
+                if i == 2:
+                    raise
+                time.sleep(5)
+        global _session
+        _session = s
         s.default_timeout = 20
         now = int(time.time())
         stale = 0
@@ -103,6 +127,7 @@ data:
                         "footer": {"text": "montcada-watchdog · bluebird"}})
                     s.execute("INSERT INTO bluebird.watchdog_alert (source, last_alert) "
                               "VALUES (%s, %s)", (name, now))
+                    log_event(s, name, "alerta")
                 print(f"STALE {name}: 0 filas desde {since}")
             else:
                 if row and now - row.last_alert < RECOVER_WINDOW_S:
@@ -111,6 +136,7 @@ data:
                                   "color": 0x2ECC71,
                                   "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                                   "footer": {"text": "montcada-watchdog · bluebird"}})
+                    log_event(s, name, "recuperacio")
                 if row:
                     s.execute("DELETE FROM bluebird.watchdog_alert WHERE source=%s", (name,))
                 print(f"OK {name}: {n} filas en ventana")
@@ -128,6 +154,7 @@ data:
                               "color": 0xF1C40F,
                               "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                               "footer": {"text": "montcada-watchdog · bluebird"}})
+                log_event(_session, "montcada-watchdog", "error")
             except Exception:
                 pass
             sys.exit(1)
